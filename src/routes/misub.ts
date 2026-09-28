@@ -31,6 +31,9 @@ misubRoutes.put("/settings", requireAdmin, async (c) => {
 });
 
 // ==================== 手动节点 ====================
+// 注意：静态路径（/nodes/groups、/nodes/groups/reorder、/nodes/reorder、
+// /nodes/batch-delete、/nodes/preview-subscription、/nodes/import-selected、/speedtest-url）
+// 必须全部注册在动态参数路径（/nodes/:id）之前，否则会被 :id 吞掉。
 
 misubRoutes.get("/nodes", async (c) => {
   const user = c.get("user") as JwtPayload;
@@ -41,6 +44,7 @@ misubRoutes.get("/nodes", async (c) => {
   return c.json(results);
 });
 
+/** 分组列表：按 misub_group_order 的自定义顺序排；未记录的组排后面（按名称） */
 misubRoutes.get("/nodes/groups", async (c) => {
   const user = c.get("user") as JwtPayload;
   const { where, bind } = scopeClause(user);
@@ -49,10 +53,58 @@ misubRoutes.get("/nodes/groups", async (c) => {
   )
     .bind(...bind)
     .all<{ group_name: string }>();
-  return c.json(results.map((r) => r.group_name));
+
+  const existing = results.map(r => r.group_name);
+  const { results: orderRows } = await c.env.DB.prepare(
+    "SELECT group_name, sort_order FROM misub_group_order ORDER BY sort_order"
+  ).all<{ group_name: string; sort_order: number }>();
+  const orderMap = new Map(orderRows.map(r => [r.group_name, r.sort_order]));
+
+  const ordered = existing.sort((a, b) => {
+    const oa = orderMap.has(a) ? orderMap.get(a)! : 100000 + a.localeCompare(b);
+    const ob = orderMap.has(b) ? orderMap.get(b)! : 100000 + b.localeCompare(a);
+    return oa - ob;
+  });
+  return c.json(ordered);
 });
 
-/** 新增节点：body: { name?, group?, text }，text 支持单条链接，也支持多行粘贴批量导入 */
+/** 分组chips拖动排序：body { orderedGroups: string[] } */
+misubRoutes.put("/nodes/groups/reorder", async (c) => {
+  const { orderedGroups } = await c.req.json<{ orderedGroups: string[] }>();
+  if (!Array.isArray(orderedGroups)) return c.json({ error: "参数不能为空" }, 400);
+  const clean = [...new Set(orderedGroups.filter((g): g is string => typeof g === 'string' && g.trim().length > 0))];
+  await c.env.DB.prepare("DELETE FROM misub_group_order").run();
+  if (clean.length) {
+    await c.env.DB.batch(
+      clean.map((g, i) => c.env.DB.prepare("INSERT INTO misub_group_order (group_name, sort_order) VALUES (?,?)").bind(g, i))
+    );
+  }
+  return c.json({ ok: true });
+});
+
+/** 节点拖拽排序：body { orderedIds: number[] }（服务端过滤非法值） */
+misubRoutes.put("/nodes/reorder", async (c) => {
+  const { orderedIds } = await c.req.json<{ orderedIds: number[] }>();
+  if (!Array.isArray(orderedIds)) return c.json({ error: "参数不能为空" }, 400);
+  const cleanIds = [...new Set(orderedIds)].filter(id => Number.isInteger(id));
+  if (!cleanIds.length) return c.json({ error: "没有有效的节点ID" }, 400);
+  await c.env.DB.batch(
+    cleanIds.map((id, i) => c.env.DB.prepare("UPDATE misub_nodes SET sort_order = ? WHERE id = ?").bind(i, id))
+  );
+  return c.json({ ok: true });
+});
+
+/** 批量删除节点 */
+misubRoutes.post("/nodes/batch-delete", async (c) => {
+  const { ids } = await c.req.json<{ ids: number[] }>();
+  if (!Array.isArray(ids) || !ids.length) return c.json({ error: "参数不能为空" }, 400);
+  const cleanIds = ids.filter(id => Number.isInteger(id));
+  if (!cleanIds.length) return c.json({ error: "没有有效的节点ID" }, 400);
+  await c.env.DB.batch(cleanIds.map((id) => c.env.DB.prepare("DELETE FROM misub_nodes WHERE id = ?").bind(id)));
+  return c.json({ ok: true, deleted: cleanIds.length });
+});
+
+/** 新增节点：{ name?, group?, text }，text 支持单条或多行批量 */
 misubRoutes.post("/nodes", async (c) => {
   const user = c.get("user") as JwtPayload;
   const { name, group, text } = await c.req.json<{ name?: string; group?: string; text: string }>();
@@ -76,7 +128,7 @@ misubRoutes.post("/nodes", async (c) => {
   return c.json({ ok: true, imported: lines.length });
 });
 
-/** 第一步：拉取外部订阅地址的内容，解析出节点列表，只返回预览，不写入数据库 */
+/** 第一步：拉取外部订阅，解析节点列表，只返回预览不落库 */
 misubRoutes.post("/nodes/preview-subscription", async (c) => {
   const { url } = await c.req.json<{ url: string }>();
   if (!url) return c.json({ error: "请提供订阅地址" }, 400);
@@ -90,7 +142,6 @@ misubRoutes.post("/nodes/preview-subscription", async (c) => {
     const text = await res.text();
     const nodeUrls = decodeSubscriptionNodes(text);
     if (!nodeUrls.length) {
-      // 帮着排查：把响应内容的开头一小段带出来，方便看到底是什么格式导致解析不出节点
       const preview = text.slice(0, 150).replace(/\s+/g, " ");
       return c.json({ error: `没有解析出节点。响应内容开头：${preview || "(空)"}` }, 200);
     }
@@ -100,7 +151,7 @@ misubRoutes.post("/nodes/preview-subscription", async (c) => {
   }
 });
 
-/** 第二步：把预览里勾选的节点正式导入成手动节点 */
+/** 第二步：把预览勾选的节点正式导入 */
 misubRoutes.post("/nodes/import-selected", async (c) => {
   const user = c.get("user") as JwtPayload;
   const { items, group } = await c.req.json<{ items: { name: string; url: string }[]; group?: string }>();
@@ -119,7 +170,7 @@ misubRoutes.post("/nodes/import-selected", async (c) => {
   return c.json({ ok: true, imported: items.length });
 });
 
-/** 对一个还没入库的节点链接直接测速（订阅导入预览页的"全部测速"用这个，不需要先有节点ID） */
+/** 未入库节点链接直接测速（预览页用） */
 misubRoutes.post("/speedtest-url", async (c) => {
   const { url } = await c.req.json<{ url: string }>();
   const target = parseHostPort(url);
@@ -127,35 +178,29 @@ misubRoutes.post("/speedtest-url", async (c) => {
   return c.json(await doSpeedTest(target));
 });
 
+/** 部分更新节点：只更新请求里带的字段，其余保留原值（根治 D1 undefined） */
 misubRoutes.put("/nodes/:id", async (c) => {
-  const { name, url, group, enabled } = await c.req.json<{ name?: string; url?: string; group?: string; enabled?: boolean }>();
-  await c.env.DB.prepare("UPDATE misub_nodes SET name=?, url=?, group_name=?, enabled=?, updated_at=? WHERE id=?")
-    .bind(name, url, group || null, enabled === false ? 0 : 1, now(), Number(c.req.param("id")))
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json<{ name?: string; url?: string; group?: string; enabled?: boolean }>();
+  const row = await c.env.DB.prepare("SELECT * FROM misub_nodes WHERE id = ?").bind(id).first<any>();
+  if (!row) return c.json({ error: "节点不存在" }, 404);
+
+  await c.env.DB.prepare(
+    "UPDATE misub_nodes SET name=?, url=?, group_name=?, enabled=?, updated_at=? WHERE id=?"
+  )
+    .bind(
+      body.name !== undefined ? body.name : row.name,
+      body.url !== undefined ? body.url : row.url,
+      body.group !== undefined ? (body.group || null) : row.group_name,
+      body.enabled !== undefined ? (body.enabled ? 1 : 0) : row.enabled,
+      now(),
+      id
+    )
     .run();
   return c.json({ ok: true });
 });
 
-misubRoutes.post("/nodes/batch-delete", async (c) => {
-  const { ids } = await c.req.json<{ ids: number[] }>();
-  if (!Array.isArray(ids) || !ids.length) return c.json({ error: "参数不能为空" }, 400);
-  await c.env.DB.batch(ids.map((id) => c.env.DB.prepare("DELETE FROM misub_nodes WHERE id = ?").bind(id)));
-  return c.json({ ok: true });
-});
-
-/** 拖拽排序：只在"全部"筛选（未按分组过滤）时调用，避免分组过滤时局部排序把全局sort_order搞乱 */
-misubRoutes.put("/nodes/reorder", async (c) => {
-  const { orderedIds } = await c.req.json<{ orderedIds: number[] }>();
-  await c.env.DB.batch(
-    orderedIds.map((id, i) => c.env.DB.prepare("UPDATE misub_nodes SET sort_order = ? WHERE id = ?").bind(i, id))
-  );
-  return c.json({ ok: true });
-});
-
-/**
- * 测速：对节点链接解析出的 host:port 发起一次 TCP 连接（cloudflare:sockets），测的是连接握手耗时，
- * 不是真实代理转发速度。注意：不少机场会屏蔽云服务商（含Cloudflare）的出口IP段，测出"连接失败"
- * 不代表节点真的不可用，仅供参考。结果会持久化，卡片上会一直显示上次测速结果。
- */
+/** 单节点测速（TCP握手；结果持久化） */
 misubRoutes.post("/nodes/:id/speedtest", async (c) => {
   const id = Number(c.req.param("id"));
   const row = await c.env.DB.prepare("SELECT url FROM misub_nodes WHERE id = ?").bind(id).first<{ url: string }>();
@@ -174,7 +219,6 @@ misubRoutes.post("/nodes/:id/speedtest", async (c) => {
   return c.json(result);
 });
 
-/** 对一个 host:port 发起一次TCP连接测速，返回 {ok, latency} 或 {ok:false, error} */
 async function doSpeedTest(target: { host: string; port: number }): Promise<{ ok: boolean; latency?: number; error?: string }> {
   let socket: any;
   try {
@@ -192,13 +236,14 @@ async function doSpeedTest(target: { host: string; port: number }): Promise<{ ok
       try {
         await socket.close();
       } catch {
-        /* 忽略关闭失败，避免影响响应 */
+        /* 忽略关闭失败 */
       }
     }
   }
 }
 
 // ==================== 订阅组 (Profiles) ====================
+// 路由顺序：/profiles/reorder 必须在 /profiles/:id 之前（静态优先）！
 
 misubRoutes.get("/profiles", async (c) => {
   const user = c.get("user") as JwtPayload;
@@ -207,6 +252,18 @@ misubRoutes.get("/profiles", async (c) => {
     .bind(...bind)
     .all();
   return c.json(results);
+});
+
+/** 订阅组卡片拖动排序：body { orderedIds: number[] } */
+misubRoutes.put("/profiles/reorder", async (c) => {
+  const { orderedIds } = await c.req.json<{ orderedIds: number[] }>();
+  if (!Array.isArray(orderedIds)) return c.json({ error: "参数不能为空" }, 400);
+  const cleanIds = [...new Set(orderedIds)].filter(id => Number.isInteger(id));
+  if (!cleanIds.length) return c.json({ error: "没有有效的订阅组ID" }, 400);
+  await c.env.DB.batch(
+    cleanIds.map((id, i) => c.env.DB.prepare("UPDATE misub_profiles SET sort_order = ? WHERE id = ?").bind(i, id))
+  );
+  return c.json({ ok: true });
 });
 
 async function validateCustomId(env: Env, customId: string | undefined, excludeProfileId?: number): Promise<string | null> {
@@ -271,14 +328,6 @@ misubRoutes.put("/profiles/:id", async (c) => {
   return c.json({ ok: true });
 });
 
-misubRoutes.put("/profiles/reorder", async (c) => {
-  const { orderedIds } = await c.req.json<{ orderedIds: number[] }>();
-  await c.env.DB.batch(
-    orderedIds.map((id, i) => c.env.DB.prepare("UPDATE misub_profiles SET sort_order = ? WHERE id = ?").bind(i, id))
-  );
-  return c.json({ ok: true });
-});
-
 misubRoutes.delete("/profiles/:id", async (c) => {
   const id = Number(c.req.param("id"));
   await c.env.DB.prepare("DELETE FROM misub_profiles WHERE id = ?").bind(id).run();
@@ -311,12 +360,9 @@ function extractNodeName(url: string): string {
 
 export function decodeSubscriptionNodes(text: string): string[] {
   const trimmed = text.trim();
-  // 明文格式：直接就是一行（或多行）节点链接
   if (/^[a-z0-9]+:\/\//i.test(trimmed)) {
     return trimmed.split("\n").map((l) => l.trim()).filter(Boolean);
   }
-  // base64整体编码格式（机场订阅最常见）。先去掉所有空白字符（有些订阅会把base64内容折成多行），
-  // 转成标准字符集，并补齐到4的倍数长度（很多机场返回的base64缺尾部的'='填充，atob会直接报错）。
   try {
     let b64 = trimmed.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
     const pad = b64.length % 4;
@@ -328,7 +374,6 @@ export function decodeSubscriptionNodes(text: string): string[] {
   }
 }
 
-/** 从各协议节点链接里解析出 host:port，尽量覆盖常见格式（包括SS的两种编码方式） */
 function parseHostPort(nodeUrl: string): { host: string; port: number } | null {
   try {
     const scheme = nodeUrl.split("://")[0].toLowerCase();
@@ -342,24 +387,21 @@ function parseHostPort(nodeUrl: string): { host: string; port: number } | null {
     if (scheme === "ss") {
       const rest = nodeUrl.slice(5).split("#")[0];
       const atIdx = rest.lastIndexOf("@");
-      // SIP002格式: ss://base64(method:pass)@host:port 或 ss://method:pass@host:port
       if (atIdx >= 0) {
         const hostPort = rest.slice(atIdx + 1).split("?")[0].split("/")[0];
         const [host, port] = hostPort.split(":");
         if (host && port && !isNaN(Number(port))) return { host, port: Number(port) };
       }
-      // 旧版整体base64编码格式: ss://base64(method:pass@host:port)
       try {
         const decoded = atob(rest.replace(/-/g, "+").replace(/_/g, "/"));
         const m = decoded.match(/@([^:@/]+):(\d+)/);
         if (m) return { host: m[1], port: Number(m[2]) };
       } catch {
-        /* 不是合法base64，走下面统一兜底逻辑 */
+        /* fallthrough */
       }
       return null;
     }
 
-    // vless/trojan/hysteria2/hysteria/tuic 等都是标准URI形式: scheme://[userinfo@]host:port?...
     const u = new URL(nodeUrl.replace(new RegExp(`^${scheme}:\\/\\/`), "https://"));
     if (u.hostname && u.port) return { host: u.hostname, port: Number(u.port) };
     return null;
@@ -402,7 +444,6 @@ misubPublicRoutes.get("/:idOrToken", async (c) => {
     )
       .bind(...nodeIds)
       .all<{ id: number; url: string }>();
-    // 按 profile.node_ids 里保存的顺序输出，不是数据库查询返回的顺序
     const urlById = new Map(nodes.map((n) => [n.id, n.url]));
     nodeUrls = nodeIds.map((id) => urlById.get(id)).filter(Boolean) as string[];
   }

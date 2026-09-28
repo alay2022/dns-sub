@@ -14,6 +14,7 @@ import { toolsRoutes } from "./routes/tools";
 import { handleExpiryReminders } from "./cron/reminders";
 import { oauthRoutes } from "./routes/oauth";
 import { misubRoutes, misubPublicRoutes } from "./routes/misub";
+import { noticeRoutes } from "./routes/notices";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -43,6 +44,7 @@ app.route("/api/tools", toolsRoutes);
 app.route("/api/oauth", oauthRoutes);
 app.route("/api/misub", misubRoutes);
 app.route("/", misubPublicRoutes); // 公开订阅输出：GET /:idOrToken，不需要登录
+app.route("/api/notices", noticeRoutes);
 
 app.notFound((c) => c.json({ error: "Not Found" }, 404));
 app.onError((err, c) => {

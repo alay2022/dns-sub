@@ -1,43 +1,23 @@
-name = "dnsmgr-cf"
+name = "dns-sub"                    
 main = "src/index.ts"
 compatibility_date = "2024-11-01"
 compatibility_flags = ["nodejs_compat"]
 
 [[d1_databases]]
 binding = "DB"
-database_name = "dnsmgr"
-database_id = "365fc304-9ece-42f7-8adf-d65fe4d74deb"
+database_name = "dns-sub"
+database_id = "549968ea-f223-4fd7-a16d-5ba11d93c75c"
 
-# 证书签发/续签本身已经搬到 GitHub Actions 里跑（见 .github/workflows/），
-# 续签检查由 .github/workflows/renew-certs.yml 的 schedule 触发。
-# 这里的 Cron Trigger 只用于「域名/证书到期提醒通知」，是轻量任务（只查数据库+发通知，
-# 没有ACME签名运算），放在 Workers 里跑没有CPU限制问题。
-# 0 0 * * * = 每天 UTC 00:00 = 北京时间每天 08:00
 [triggers]
 crons = ["0 0 * * *"]
 
 [vars]
-# 非敏感配置，敏感项请用 `wrangler secret put` 设置：
-# JWT_SECRET, ACME_ACCOUNT_EMAIL, GITHUB_TOKEN, CI_CALLBACK_SECRET,
-# ACME_EAB_KID（如用ZeroSSL）, ACME_EAB_HMAC_KEY（如用ZeroSSL）
-APP_NAME = "DNSMGR-CF"
+APP_NAME = "DNS-SUB"                      # 顺手改掉
 JWT_EXPIRE_SECONDS = "86400"
 APPLINK_EXPIRE_SECONDS = "300"
 CI_TOKEN_EXPIRE_SECONDS = "1800"
-GITHUB_OWNER = "alay2022"
-GITHUB_REPO = "dnsmgr-cf"
+GITHUB_OWNER = "alay2022"          # ← 如果以后配证书续签
+GITHUB_REPO = "dns-sub"
 GITHUB_REF = "main"
-# 可选：如遇到 Cloudflare Workers 访问 Let's Encrypt 的已知525问题（见README「已知问题」），
-# 取消下面这行注释切换到 ZeroSSL（免费，但需要额外配置EAB凭据，见README说明）：
-# ACME_DIRECTORY_URL = "https://acme.zerossl.com/v2/DV90"
-
-# 第三方登录的具体配置（Client ID/Secret/各平台端点地址）已经从这里移到系统内
-# 「系统设置 → 第三方登录管理」页面维护了，管理员登录后台就能改，不用再碰这个文件。
-# 这两个是仅有的、跟部署环境相关的基础地址，还留在这里：
-OAUTH_REDIRECT_BASE = "https://dnsmgr-cf.alay.workers.dev"
-FRONTEND_BASE = "https://dns.ztvps.com"
-
-# 可选：MiSub订阅管理里，把订阅转换成Clash/Surge/singbox等客户端专属格式时用到的subconverter服务地址。
-# 不配置的话只能用通用(base64)格式，大多数客户端（V2rayN/V2rayNG/Shadowrocket等）都认这个格式，够用。
-# 公开的subconverter实例可以自己搜，或者自建一个（推荐，公开实例不稳定也有隐私风险）：https://github.com/tindy2013/subconverter
-# MISUB_SUBCONVERTER_URL = "https://your-subconverter.example.com/sub"
+OAUTH_REDIRECT_BASE = "https://dns-sub.alay.workers.dev"   # ← 用你的实际子域
+FRONTEND_BASE = "https://v.ztvps.com"   # 以后 Pages 前端的地址，先留着

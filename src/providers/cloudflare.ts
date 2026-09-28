@@ -77,6 +77,7 @@ export class CloudflareProvider implements DnsProvider {
         ttl: record.proxied ? 1 : record.ttl || 1, // 开启代理时TTL必须为Automatic(1)
         priority: record.priority,
         proxied: !!record.proxied,
+	comment: record.remark || undefined,   // ← 加这行
       }),
     });
     return data.result.id;
@@ -94,6 +95,7 @@ export class CloudflareProvider implements DnsProvider {
         ttl: record.proxied ? 1 : record.ttl || 1,
         priority: record.priority,
         proxied: !!record.proxied,
+	comment: record.remark || undefined,   // ← 加这行
       }),
     });
   }

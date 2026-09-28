@@ -1,18 +1,68 @@
 import { Hono } from "hono";
 import type { Env, JwtPayload } from "../types";
-import { verifyPassword, signJwt } from "../utils/crypto";
+import { verifyPassword, signJwt, hashPassword } from "../utils/crypto";
 import { userHasDomainPerm, now, insertAuditLog } from "../db";
 import { notifyDomainOwners } from "../notify/domainOwners";
+import { requireAuth, requireAdmin } from "../middleware/auth";
 
 export const ciTokenRoutes = new Hono<{ Bindings: Env }>();
 export const ciCallbackRoutes = new Hono<{ Bindings: Env }>();
 
+/* =====================================================================
+   API Key 管理（管理员，供 GitHub Actions 证书签发用）
+   路由用 /ci-keys（不用 /keys）：applink.ts 已占用 /keys（老系统"开放API"
+   端点，返回 {apiKey, apiSecret} 且无 id 字段），注册在前会抢走 /keys 请求。
+   注意：每个路由都要 requireAuth 在 requireAdmin 之前——requireAdmin 依赖
+   requireAuth 挂载的 user（单独用会 500: reading 'role' of undefined）。
+   /ci-token 保持无登录鉴权（Actions 匿名调用，靠 API Key/Secret 自证）。
+   ===================================================================== */
+
+/** 签发 API Key：POST /api/open/ci-keys  body { remark? } → { ok, id, key, secret }（secret 仅此一次明文） */
+ciTokenRoutes.post("/ci-keys", requireAuth, requireAdmin, async (c) => {
+  const user = c.get("user") as JwtPayload;
+  const { remark } = await c.req.json<{ remark?: string }>().catch(() => ({ remark: undefined }));
+  const key = "dk_" + crypto.randomUUID().replace(/-/g, "");
+  const secret = "ds_" + crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
+  const hash = await hashPassword(secret);
+  const res = await c.env.DB.prepare(
+    "INSERT INTO api_keys (user_id, key, secret_hash, remark, status, created_at) VALUES (?,?,?,?,?,?)"
+  )
+    .bind(user.uid, key, hash, remark || "GitHub Actions 证书签发", "active", now())
+    .run();
+  return c.json({ ok: true, id: res.meta.last_row_id, key, secret });
+});
+
+/** 列表：GET /api/open/ci-keys → [{ id, key, remark, status, created_at }]（不回 secret） */
+ciTokenRoutes.get("/ci-keys", requireAuth, requireAdmin, async (c) => {
+  const user = c.get("user") as JwtPayload;
+  const { results } = await c.env.DB.prepare(
+    "SELECT id, key, remark, status, created_at FROM api_keys WHERE user_id = ? ORDER BY id DESC"
+  ).bind(user.uid).all();
+  return c.json(results);
+});
+
+/** 吊销（保留记录）：PUT /api/open/ci-keys/:id/revoke */
+ciTokenRoutes.put("/ci-keys/:id/revoke", requireAuth, requireAdmin, async (c) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isInteger(id)) return c.json({ error: "无效的ID" }, 400);
+  await c.env.DB.prepare("UPDATE api_keys SET status = 'revoked' WHERE id = ?").bind(id).run();
+  return c.json({ ok: true });
+});
+
+/** 物理删除：DELETE /api/open/ci-keys/:id */
+ciTokenRoutes.delete("/ci-keys/:id", requireAuth, requireAdmin, async (c) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isInteger(id)) return c.json({ error: "无效的ID" }, 400);
+  await c.env.DB.prepare("DELETE FROM api_keys WHERE id = ?").bind(id).run();
+  return c.json({ ok: true });
+});
+
 /**
  * POST /api/open/ci-token
  * body: { apiKey, apiSecret, domainId }
- * 专供 GitHub Actions 使用：签发一个域名限定、有效期更长（默认30分钟，够跑完整个DNS-01流程）的token，
- * 用于调用 /api/domains/:id/records 完成 TXT 记录的增删。复用现有的 API Key 体系，
- * 和 applink 的区别只是有效期更长、用途是给CI而不是给人点开浏览器。
+ * 专供 GitHub Actions：用 API Key 换一个域名限定、有效期较长（默认30分钟）的 JWT，
+ * 用于调用 /api/domains/:id/records 完成 DNS-01 的 TXT 记录增删。
+ * 鉴权：api_keys 表（key 明文 + PBKDF2(secret) 哈希）；权限：admin 或该域名 readwrite。
  */
 ciTokenRoutes.post("/ci-token", async (c) => {
   const { apiKey, apiSecret, domainId } = await c.req.json<{ apiKey: string; apiSecret: string; domainId: number }>();
@@ -46,6 +96,7 @@ ciTokenRoutes.post("/ci-token", async (c) => {
   return c.json({ token, expiresIn: expireSeconds });
 });
 
+/** 回调鉴权：header X-CI-Secret 必须与 Worker secret CI_CALLBACK_SECRET 一致 */
 function requireCiSecret(c: any): boolean {
   const secret = c.req.header("X-CI-Secret");
   return !!secret && !!c.env.CI_CALLBACK_SECRET && secret === c.env.CI_CALLBACK_SECRET;
@@ -54,8 +105,8 @@ function requireCiSecret(c: any): boolean {
 /**
  * POST /api/ci/certs/:certId/complete
  * header: X-CI-Secret
- * body: { status: 'issued'|'failed', certPem?, keyPem?, expiresAt?, error? }
- * GitHub Actions 签发完成后调用这个接口把结果写回数据库，并触发通知。
+ * body: { status: 'issued'|'failed', certPem?, keyPem?, expiresAt?, issuer?, error? }
+ * GitHub Actions 签发完成后回调写回数据库，并触发通知（成功/失败都通知）。
  */
 ciCallbackRoutes.post("/certs/:certId/complete", async (c) => {
   if (!requireCiSecret(c)) return c.json({ error: "无效的CI密钥" }, 401);
@@ -78,7 +129,7 @@ ciCallbackRoutes.post("/certs/:certId/complete", async (c) => {
     await c.env.DB.prepare(
       `UPDATE ssl_certs SET status='issued', cert_pem=?, key_pem=?, issuer=?, issued_at=?, expires_at=?, updated_at=? WHERE id=?`
     )
-      .bind(body.certPem, body.keyPem, body.issuer ?? null, ts, body.expiresAt, ts, certId)
+      .bind(body.certPem ?? null, body.keyPem ?? null, body.issuer ?? null, ts, body.expiresAt ?? null, ts, certId)
       .run();
     await insertAuditLog(c.env, null, "ci_issue_cert_success", `cert:${certId}`, cert.common_name);
     await notifyDomainOwners(c.env, cert.domain_id, {
@@ -100,7 +151,7 @@ ciCallbackRoutes.post("/certs/:certId/complete", async (c) => {
 /**
  * GET /api/ci/due-for-renewal
  * header: X-CI-Secret
- * 返回20天内到期、且开启了自动续签的证书列表，供 GitHub Actions 的定时续签任务使用。
+ * 返回20天内到期、且开启自动续签的证书列表，供 GitHub Actions 定时续签任务（renew-certs.ts）使用。
  */
 ciCallbackRoutes.get("/due-for-renewal", async (c) => {
   if (!requireCiSecret(c)) return c.json({ error: "无效的CI密钥" }, 401);
