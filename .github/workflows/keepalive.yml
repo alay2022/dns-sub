@@ -1,0 +1,15 @@
+name: Keepalive
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # 每周一 UTC 3:00
+permissions:
+  contents: write
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive" && git push || true
