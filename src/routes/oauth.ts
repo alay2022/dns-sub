@@ -43,6 +43,19 @@ oauthRoutes.get("/providers", async (c) => {
   return c.json({ available: results.map((r) => r.provider), labels: Object.fromEntries(results.map((r) => [r.provider, r.label])) });
 });
 
+/** 拖拽排序：决定登录页上"使用XX登录"按钮的先后顺序 */
+// 注意：静态路径 /admin/providers/reorder 必须注册在 /admin/providers/:provider 之前，
+// 否则 reorder 会被 :provider 吞掉（provider="reorder" → 查不到 → 404）。
+oauthRoutes.put("/admin/providers/reorder", requireAuth, requireAdmin, async (c) => {
+  const { orderedProviders } = await c.req.json<{ orderedProviders: string[] }>();
+  await c.env.DB.batch(
+    orderedProviders.map((p, i) =>
+      c.env.DB.prepare("UPDATE oauth_provider_configs SET sort_order = ? WHERE provider = ?").bind(i, p)
+    )
+  );
+  return c.json({ ok: true });
+});
+
 oauthRoutes.get("/:provider/start", async (c) => {
   const provider = c.req.param("provider");
   const config = await getEnabledProvider(c.env, provider);
@@ -104,7 +117,7 @@ oauthRoutes.get("/:provider/callback", async (c) => {
     if (!accessToken) throw new Error(`未能获取access_token: ${JSON.stringify(tokenData)}`);
 
     const userRes = await fetch(config.userinfo_url!, {
-      headers: { Authorization: `Bearer ${accessToken}`, "User-Agent": "dnsmgr-cf" },
+      headers: { Authorization: `Bearer ${accessToken}`, "User-Agent": "dns-sub-worker" },
     });
     const profile = (await userRes.json()) as any;
 
@@ -144,7 +157,7 @@ oauthRoutes.get("/:provider/callback", async (c) => {
       c.env.JWT_SECRET
     );
     await insertAuditLog(c.env, user.id, "oauth_login", provider);
-    return c.redirect(`${frontendBase}/direct-login?token=${jwtToken}`);
+    return c.redirect(`${frontendBase}/?direct-login=1&token=${jwtToken}`);
   } catch (e: any) {
     console.error(e);
     return c.redirect(`${frontendBase}/?oauth_error=${encodeURIComponent(e.message)}`);
@@ -228,16 +241,5 @@ oauthRoutes.put("/admin/providers/:provider", requireAuth, requireAdmin, async (
       provider
     )
     .run();
-  return c.json({ ok: true });
-});
-
-/** 拖拽排序：决定登录页上"使用XX登录"按钮的先后顺序 */
-oauthRoutes.put("/admin/providers/reorder", requireAuth, requireAdmin, async (c) => {
-  const { orderedProviders } = await c.req.json<{ orderedProviders: string[] }>();
-  await c.env.DB.batch(
-    orderedProviders.map((p, i) =>
-      c.env.DB.prepare("UPDATE oauth_provider_configs SET sort_order = ? WHERE provider = ?").bind(i, p)
-    )
-  );
   return c.json({ ok: true });
 });

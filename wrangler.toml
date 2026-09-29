@@ -19,5 +19,5 @@ CI_TOKEN_EXPIRE_SECONDS = "1800"
 GITHUB_OWNER = "alay2022"          # ← 如果以后配证书续签
 GITHUB_REPO = "dns-sub"
 GITHUB_REF = "main"
-OAUTH_REDIRECT_BASE = "https://dns-sub.alay.workers.dev"   # ← 用你的实际子域
-FRONTEND_BASE = "https://v.ztvps.com"   # 以后 Pages 前端的地址，先留着
+OAUTH_REDIRECT_BASE = "https://api.ztvps.com"   # ← 用你的实际子域
+FRONTEND_BASE = "https://vip.ztvps.com"   # 以后 Pages 前端的地址，先留着

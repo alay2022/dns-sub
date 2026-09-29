@@ -1,76 +1,112 @@
 import { Hono } from "hono";
 import type { Env } from "../types";
 import { requireAuth } from "../middleware/auth";
-import { safeJson } from "../utils/http";
 import { lookupWhois } from "../utils/whois";
 
 export const toolsRoutes = new Hono<{ Bindings: Env }>();
 toolsRoutes.use("*", requireAuth);
 
 /**
- * DNS查询：GET /api/tools/dns-lookup?domain=example.com&type=A
- * 通过 Cloudflare 的 DoH（DNS over HTTPS）服务查询，服务端代理避免浏览器端CORS问题。
+ * DNS 查询：GET /api/tools/dns-lookup?domain=example.com&type=A
+ * Cloudflare DoH（免费无需Key），服务端发起避免浏览器 CORS。
  */
 toolsRoutes.get("/dns-lookup", async (c) => {
-  const domain = c.req.query("domain");
-  const type = c.req.query("type") || "A";
-  if (!domain) return c.json({ error: "缺少domain参数" }, 400);
+  const domain = (c.req.query("domain") || "").trim();
+  const type = (c.req.query("type") || "A").toUpperCase();
+  if (!domain) return c.json({ error: "缺少 domain 参数" }, 400);
+  const allowed = ["A", "AAAA", "CNAME", "TXT", "MX", "NS"];
+  if (!allowed.includes(type)) return c.json({ error: "不支持的记录类型" }, 400);
 
-  const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=${type}`, {
-    headers: { accept: "application/dns-json" },
-  });
-  const data = await safeJson(res, "DNS查询");
-  return c.json({
-    domain,
-    type,
-    status: data.Status,
-    answers: (data.Answer || []).map((a: any) => ({ name: a.name, type: a.type, ttl: a.TTL, data: a.data })),
-  });
-});
-
-/**
- * Whois查询：GET /api/tools/whois?domain=example.com
- * 通过 RDAP（新一代Whois标准协议，免费无需Key）查询，逻辑见 utils/whois.ts。
- */
-toolsRoutes.get("/whois", async (c) => {
-  const domain = c.req.query("domain");
-  if (!domain) return c.json({ error: "缺少domain参数" }, 400);
   try {
-    return c.json(await lookupWhois(domain));
+    const res = await fetch(
+      `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=${type}`,
+      { headers: { accept: "application/dns-json" } }
+    );
+    if (!res.ok) return c.json({ error: `DoH 查询失败 (HTTP ${res.status})` }, 502);
+    const data = await res.json() as any;
+    return c.json({
+      domain, type,
+      status: data.Status ?? -1,
+      answers: (data.Answer || []).map((a: any) => ({ name: a.name, type: a.type, ttl: a.TTL, data: a.data })),
+    });
   } catch (e: any) {
-    return c.json({ error: e.message }, 500);
+    return c.json({ error: e.message || "查询失败" }, 502);
   }
 });
 
-/**
- * 证书检查：GET /api/tools/cert-check?domain=example.com
- * 通过 crt.sh（Certificate Transparency日志公开查询接口，免费无需Key）查询该域名最近签发的证书记录。
- */
-toolsRoutes.get("/cert-check", async (c) => {
-  const domain = c.req.query("domain");
-  if (!domain) return c.json({ error: "缺少domain参数" }, 400);
-
-  const res = await fetch(`https://crt.sh/?q=${encodeURIComponent(domain)}&output=json`);
-  if (!res.ok) return c.json({ error: `crt.sh查询失败 (HTTP ${res.status})` }, 502);
-  const text = await res.text();
-  let data: any[];
+/** Whois 查询：GET /api/tools/whois?domain=xxx（复用 RDAP 实现） */
+toolsRoutes.get("/whois", async (c) => {
+  const domain = (c.req.query("domain") || "").trim();
+  if (!domain) return c.json({ error: "缺少 domain 参数" }, 400);
   try {
-    data = JSON.parse(text);
-  } catch {
-    return c.json({ error: "crt.sh返回了非预期内容，可能查询过于频繁被限流，请稍后重试" }, 502);
+    return c.json((await lookupWhois(domain)) ?? {});
+  } catch (e: any) {
+    return c.json({ error: e.message || "Whois 查询失败" }, 502);
   }
+});
 
-  // 按签发时间倒序，去重，只保留最近10条
-  const sorted = data
-    .sort((a, b) => new Date(b.entry_timestamp).getTime() - new Date(a.entry_timestamp).getTime())
-    .slice(0, 10)
-    .map((r) => ({
-      commonName: r.common_name,
-      issuer: r.issuer_name,
-      notBefore: r.not_before,
-      notAfter: r.not_after,
-      entryTimestamp: r.entry_timestamp,
-    }));
+/** 证书透明度：GET /api/tools/cert-check?domain=xxx（crt.sh，最近20条去重） */
+toolsRoutes.get("/cert-check", async (c) => {
+  const domain = (c.req.query("domain") || "").trim();
+  if (!domain) return c.json({ error: "缺少 domain 参数" }, 400);
+  try {
+    const res = await fetch(`https://crt.sh/?q=${encodeURIComponent(domain)}&output=json`,
+      { headers: { "User-Agent": "dns-sub-worker" } });
+    if (!res.ok) return c.json({ error: `crt.sh 查询失败 (HTTP ${res.status})` }, 502);
+    const text = await res.text();
+    let data: any[];
+    try { data = JSON.parse(text); }
+    catch { return c.json({ error: "crt.sh 返回非JSON（可能被限流），请稍后重试" }, 502); }
+    if (!Array.isArray(data)) return c.json({ certs: [] });
 
-  return c.json({ domain, certificates: sorted });
+    const seen = new Set<string>();
+    const certs = data
+      .sort((a, b) => new Date(b.entry_timestamp).getTime() - new Date(a.entry_timestamp).getTime())
+      .filter((r) => {
+        const k = `${r.common_name}|${r.not_before}`;
+        if (seen.has(k)) return false;
+        seen.add(k); return true;
+      })
+      .slice(0, 20)
+      .map((r) => ({
+        commonName: r.common_name,
+        issuer: r.issuer_name,
+        notBefore: r.not_before,
+        notAfter: r.not_after,
+      }));
+    return c.json({ certs });
+  } catch (e: any) {
+    return c.json({ error: e.message || "查询失败" }, 502);
+  }
+});
+
+/** base64url（供 subconverter 的 url 参数） */
+function toBase64Url(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * 订阅转换：POST /api/tools/sub-convert  body { target, nodesText }
+ * 服务端调用公共 subconverter（dler.io 免费公益实例，无需任何配置），
+ * 规避浏览器 CORS。target：clash / surge / v2ray / mixed。
+ */
+toolsRoutes.post("/sub-convert", async (c) => {
+  const { target, nodesText } = await c.req.json<{ target: string; nodesText: string }>();
+  if (!nodesText || !nodesText.trim()) return c.json({ error: "请粘贴节点或分享链接" }, 400);
+  const allowedTargets = ["clash", "surge", "v2ray", "mixed"];
+  const t = allowedTargets.includes(target) ? target : "clash";
+
+  const url = `https://api.dler.io/sub?target=${t}&url=${encodeURIComponent(toBase64Url(nodesText.trim()))}&insert=false`;
+  try {
+    const res = await fetch(url, { headers: { "User-Agent": "dns-sub-worker" } });
+    if (!res.ok) return c.json({ error: `转换服务返回 HTTP ${res.status}` }, 502);
+    const text = await res.text();
+    if (!text.trim()) return c.json({ error: "转换服务返回了空结果，请检查节点链接格式" }, 502);
+    return c.json({ ok: true, target: t, text: text.slice(0, 500000) });
+  } catch (e: any) {
+    return c.json({ error: e.message || "转换失败" }, 502);
+  }
 });

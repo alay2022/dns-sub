@@ -7,7 +7,7 @@ import { triggerGithubWorkflow } from "../github";
 export const sslRoutes = new Hono<{ Bindings: Env }>();
 sslRoutes.use("*", requireAuth);
 
-/** 最小 zip 打包（store 模式）——已核对字段偏移 */
+/** 最小 zip 打包（store 模式，已验证可正常解压） */
 function makeZip(files: { name: string; data: Uint8Array }[]): Uint8Array {
   const enc = new TextEncoder();
   const parts: Uint8Array[] = [];
@@ -29,40 +29,38 @@ function makeZip(files: { name: string; data: Uint8Array }[]): Uint8Array {
     const name = enc.encode(f.name);
     const crc = crc32(f.data);
 
-    // Local File Header (30 + nameLen)
     const lh = new Uint8Array(30 + name.length);
-    lh.set(u32(0x04034b50), 0);      // signature
-    lh.set(u16(20), 4);              // version needed
-    lh.set(u16(0x0800), 6);          // flags: UTF-8
-    lh.set(u16(0), 8);               // method: store
-    lh.set(u16(0), 10);              // time
-    lh.set(u16(0x21), 12);           // date (1980-01-01)
+    lh.set(u32(0x04034b50), 0);
+    lh.set(u16(20), 4);
+    lh.set(u16(0x0800), 6);          // UTF-8 flag
+    lh.set(u16(0), 8);               // store
+    lh.set(u16(0), 10);
+    lh.set(u16(0x21), 12);
     lh.set(u32(crc), 14);
-    lh.set(u32(f.data.length), 18);  // compressed size
-    lh.set(u32(f.data.length), 22);  // uncompressed size
+    lh.set(u32(f.data.length), 18);
+    lh.set(u32(f.data.length), 22);
     lh.set(u16(name.length), 26);
     lh.set(u16(0), 28);
     lh.set(name, 30);
     parts.push(lh, f.data);
 
-    // Central Directory Entry (46 + nameLen)
     const ch = new Uint8Array(46 + name.length);
     ch.set(u32(0x02014b50), 0);
-    ch.set(u16(20), 4);              // version made by
-    ch.set(u16(20), 6);              // version needed
-    ch.set(u16(0x0800), 8);          // flags: UTF-8（与 local 一致）
-    ch.set(u16(0), 10);              // method: store
-    ch.set(u16(0), 12);              // time
-    ch.set(u16(0x21), 14);           // date
+    ch.set(u16(20), 4);
+    ch.set(u16(20), 6);
+    ch.set(u16(0x0800), 8);          // UTF-8 flag（与 local 一致）
+    ch.set(u16(0), 10);
+    ch.set(u16(0), 12);
+    ch.set(u16(0x21), 14);
     ch.set(u32(crc), 16);
     ch.set(u32(f.data.length), 20);
     ch.set(u32(f.data.length), 24);
     ch.set(u16(name.length), 28);
     ch.set(u16(0), 30); ch.set(u16(0), 32); ch.set(u16(0), 34);
-    ch.set(u16(0), 36);              // disk number
-    ch.set(u16(0), 38);              // internal attrs
-    ch.set(u32(0), 40);              // external attrs
-    ch.set(u32(offset), 42);         // local header offset
+    ch.set(u16(0), 36);
+    ch.set(u16(0), 38);
+    ch.set(u32(0), 40);
+    ch.set(u32(offset), 42);
     ch.set(name, 46);
     central.push(ch);
 
@@ -76,7 +74,7 @@ function makeZip(files: { name: string; data: Uint8Array }[]): Uint8Array {
   eocd.set(u16(0), 4); eocd.set(u16(0), 6);
   eocd.set(u16(files.length), 8); eocd.set(u16(files.length), 10);
   eocd.set(u32(centralSize), 12);
-  eocd.set(u32(cdStart), 16);      // central directory 起始 = 所有 local+data 之后
+  eocd.set(u32(cdStart), 16);
   eocd.set(u16(0), 20);
 
   const total = [...parts, ...central, eocd];
@@ -86,10 +84,7 @@ function makeZip(files: { name: string; data: Uint8Array }[]): Uint8Array {
   return out;
 }
 
-/**
- * 证书总览：GET /api/domains/certs 是全部域名的证书（管理员看全部，
- * 普通用户只看自己有权限的域名），供证书列表页默认展示全部、也支持上方下拉框按域名筛选。
- */
+/** 证书总览：全部域名的证书（admin 全量/用户按权限） */
 sslRoutes.get("/certs", async (c) => {
   const user = c.get("user") as JwtPayload;
   const scope =
@@ -100,12 +95,12 @@ sslRoutes.get("/certs", async (c) => {
     `SELECT sc.*, d.domain_name FROM ssl_certs sc
      JOIN domains d ON d.id = sc.domain_id
      WHERE ${scope}
-     ORDER BY sc.id DESC`
+     ORDER BY sc.sort_order ASC, sc.id DESC`
   ).all();
   return c.json(results);
 });
 
-/** 批量删除证书记录：body: { certIds: number[] }（只删本地数据库记录，不会去CA吊销证书） */
+/** 批量删除证书记录（不去CA吊销） */
 sslRoutes.post("/certs/batch-delete", async (c) => {
   const user = c.get("user") as JwtPayload;
   const { certIds } = await c.req.json<{ certIds: number[] }>();
@@ -129,20 +124,27 @@ sslRoutes.post("/certs/batch-delete", async (c) => {
   return c.json({ ok: true, deleted: cleanIds.length });
 });
 
+/** 证书拖拽排序：PUT /api/domains/certs/reorder  body { orderedIds } */
+sslRoutes.put("/certs/reorder", async (c) => {
+  const { orderedIds } = await c.req.json<{ orderedIds: number[] }>();
+  if (!Array.isArray(orderedIds)) return c.json({ error: "参数不能为空" }, 400);
+  const cleanIds = [...new Set(orderedIds)].filter(id => Number.isInteger(id));
+  if (!cleanIds.length) return c.json({ error: "没有有效的证书ID" }, 400);
+  await c.env.DB.batch(
+    cleanIds.map((id, i) => c.env.DB.prepare("UPDATE ssl_certs SET sort_order = ? WHERE id = ?").bind(i, id))
+  );
+  return c.json({ ok: true });
+});
+
 sslRoutes.get("/:domainId/certs", requireDomainPerm(false), async (c) => {
   const domainId = Number(c.req.param("domainId"));
-  const { results } = await c.env.DB.prepare("SELECT * FROM ssl_certs WHERE domain_id = ? ORDER BY id DESC")
-    .bind(domainId)
-    .all();
+  const { results } = await c.env.DB.prepare(
+    "SELECT * FROM ssl_certs WHERE domain_id = ? ORDER BY sort_order ASC, id DESC"
+  ).bind(domainId).all();
   return c.json(results);
 });
 
-/**
- * 申请证书：body: { commonName?, sans?: string[], autoRenew?: boolean }
- * commonName 留空或传 "@" 时默认为域名本身（根域名）。
- * 实际签发搬到 GitHub Actions，这里只插入 pending 记录并触发 issue-cert.yml。
- * 前端轮询 GET /:domainId/certs 获取最终状态（Actions 完成后回调 /api/ci/certs/:id/complete）。
- */
+/** 申请证书：插入 pending 并触发 GitHub Actions */
 sslRoutes.post("/:domainId/certs", requireDomainPerm(true), async (c) => {
   const user = c.get("user") as JwtPayload;
   const domainId = Number(c.req.param("domainId"));
@@ -155,11 +157,14 @@ sslRoutes.post("/:domainId/certs", requireDomainPerm(true), async (c) => {
   const sans = body.sans || [];
 
   const ts = now();
+  const maxRow = await c.env.DB.prepare("SELECT MIN(sort_order) as m FROM ssl_certs").first<{ m: number | null }>();
+  const newOrder = (maxRow?.m ?? 0) - 1;   /* 新申请的排最前 */
+
   const insertRes = await c.env.DB.prepare(
-    `INSERT INTO ssl_certs (domain_id, common_name, sans, ca, status, auto_renew, created_at, updated_at)
-     VALUES (?,?,?,?,?,?,?,?)`
+    `INSERT INTO ssl_certs (domain_id, common_name, sans, ca, status, auto_renew, sort_order, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?)`
   )
-    .bind(domainId, commonName, JSON.stringify(sans), "letsencrypt", "pending", body.autoRenew === false ? 0 : 1, ts, ts)
+    .bind(domainId, commonName, JSON.stringify(sans), "letsencrypt", "pending", body.autoRenew === false ? 0 : 1, newOrder, ts, ts)
     .run();
   const certId = insertRes.meta.last_row_id;
 
@@ -180,7 +185,7 @@ sslRoutes.post("/:domainId/certs", requireDomainPerm(true), async (c) => {
   return c.json({ ok: true, certId, status: "pending" });
 });
 
-/** 查看证书内容（JSON）：GET /:domainId/certs/:certId/view（供前端「查看」弹窗显示 PEM/KEY） */
+/** 查看证书内容（JSON） */
 sslRoutes.get("/:domainId/certs/:certId/view", requireDomainPerm(false), async (c) => {
   const certId = Number(c.req.param("certId"));
   const row = await c.env.DB.prepare("SELECT * FROM ssl_certs WHERE id = ?").bind(certId).first<any>();
@@ -188,7 +193,7 @@ sslRoutes.get("/:domainId/certs/:certId/view", requireDomainPerm(false), async (
   return c.json({ certPem: row.cert_pem, keyPem: row.key_pem, expiresAt: row.expires_at, issuer: row.issuer, issuedAt: row.issued_at });
 });
 
-/** 下载证书 zip（cert.pem + key.pem）：GET /:domainId/certs/:certId/download → application/zip */
+/** 下载证书 zip（cert.pem + key.pem）；手动补 CORS 头（原生 Response 不走中间件） */
 sslRoutes.get("/:domainId/certs/:certId/download", requireDomainPerm(false), async (c) => {
   const certId = Number(c.req.param("certId"));
   const row = await c.env.DB.prepare("SELECT * FROM ssl_certs WHERE id = ?").bind(certId).first<any>();
@@ -204,12 +209,12 @@ sslRoutes.get("/:domainId/certs/:certId/download", requireDomainPerm(false), asy
     headers: {
       "Content-Type": "application/zip",
       "Content-Disposition": `attachment; filename="cert-${row.common_name.replace(/\*/g, "_")}.zip"`,
-      "Access-Control-Allow-Origin": "*",                    // ← 加这行
+      "Access-Control-Allow-Origin": "*",
     },
   });
 });
 
-/** 续签：状态置回 pending 并触发 workflow，实际工作交给 GitHub Actions */
+/** 续签：状态置回 pending 并触发 workflow */
 sslRoutes.post("/:domainId/certs/:certId/renew", requireDomainPerm(true), async (c) => {
   const user = c.get("user") as JwtPayload;
   const domainId = Number(c.req.param("domainId"));
