@@ -16,6 +16,7 @@ import { oauthRoutes } from "./routes/oauth";
 import { misubRoutes, misubPublicRoutes } from "./routes/misub";
 import { noticeRoutes } from "./routes/notices";
 import { profileRoutes } from "./routes/profile";
+import { backupRoutes } from "./routes/backup";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -24,6 +25,7 @@ app.use("*", async (c, next) => {
   c.header("Access-Control-Allow-Origin", "*");
   c.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CI-Secret");
   c.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  c.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CI-Secret, X-Restore-Confirm");
   if (c.req.method === "OPTIONS") return c.body(null, 204);
   await next();
 });
@@ -47,6 +49,7 @@ app.route("/api/misub", misubRoutes);
 app.route("/", misubPublicRoutes); // 公开订阅输出：GET /:idOrToken，不需要登录
 app.route("/api/notices", noticeRoutes);
 app.route("/api/profile", profileRoutes);
+app.route("/api/backup", backupRoutes);
 
 app.notFound((c) => c.json({ error: "Not Found" }, 404));
 app.onError((err, c) => {
