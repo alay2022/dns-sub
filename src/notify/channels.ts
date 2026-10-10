@@ -1,3 +1,5 @@
+import { aesDecrypt } from "../utils/crypto";
+
 export interface NotifyMessage {
   title: string;
   content: string; // 支持简单文本，部分渠道支持markdown
@@ -14,8 +16,11 @@ export type NotifyChannelType =
 
 /**
  * 各渠道 config 字段约定：
- * - email:      { provider: 'resend'|'smtp_relay', apiKey?: string, from?: string, to: string }
- *               （Workers 无法直接发 SMTP，推荐通过 Resend/MailChannels 等 HTTP API 网关发送）
+ * - email:      { to: string }
+ *               （Resend API Key / 发件人 已升级为系统级配置，
+ *                 管理员在「系统设置 → 邮件通知」维护，存于 system_settings 表
+ *                 —— Key 为 AES-GCM 加密存储，读取时解密，
+ *                 渠道内只保留收件邮箱）
  * - wechat_mp:  { appId, appSecret, templateId, toOpenId }
  * - telegram:   { botToken, chatId }
  * - dingtalk:   { webhookUrl, secret? }
@@ -23,10 +28,34 @@ export type NotifyChannelType =
  * - wecom:      { webhookUrl }
  * - serverchan: { sendKey }
  */
-export async function sendNotify(type: NotifyChannelType, config: Record<string, any>, msg: NotifyMessage): Promise<void> {
+
+/** 读取系统级邮件配置（Resend Key / 发件人）；Key 是加密存储的，读取时解密 */
+async function getSystemMailConfig(env: any): Promise<{ apiKey: string; from: string }> {
+  const { results } = await env.DB.prepare(
+    "SELECT key, value FROM system_settings WHERE key IN ('mail_api_key','mail_from')"
+  ).all<{ key: string; value: string }>();
+  const map = new Map(results.map((r: any) => [r.key, r.value]));
+
+  let apiKey = map.get('mail_api_key') || '';
+  if (apiKey) {
+    try {
+      apiKey = env?.ENCRYPT_KEY ? await aesDecrypt(apiKey, env.ENCRYPT_KEY) : apiKey;
+    } catch {
+      /* 解密失败时保留原值（可能是未加密的旧数据）——Resend 会报 invalid，可据此发现 */
+    }
+  }
+  return { apiKey, from: map.get('mail_from') || '' };
+}
+
+export async function sendNotify(
+  type: NotifyChannelType,
+  config: Record<string, any>,
+  msg: NotifyMessage,
+  env?: any
+): Promise<void> {
   switch (type) {
     case "email":
-      return sendEmail(config, msg);
+      return sendEmail(config, msg, env);
     case "wechat_mp":
       return sendWechatMp(config, msg);
     case "telegram":
@@ -44,16 +73,20 @@ export async function sendNotify(type: NotifyChannelType, config: Record<string,
   }
 }
 
-async function sendEmail(config: any, msg: NotifyMessage) {
-  // 使用 Resend HTTP API 作为默认邮件网关（Workers 环境下最简单可靠的方案之一）
+/** 邮件：Key/发件人取自系统级配置（解密后），渠道 config 只需要 { to } */
+async function sendEmail(config: any, msg: NotifyMessage, env?: any) {
+  const sys = await getSystemMailConfig(env);
+  if (!sys.apiKey) throw new Error("管理员尚未配置系统邮件服务（Resend API Key），邮件通知不可用");
+  if (!config.to) throw new Error("邮件渠道缺少收件邮箱（to）");
+
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${config.apiKey}`,
+      Authorization: `Bearer ${sys.apiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      from: config.from || "DNSMGR <notify@yourdomain.com>",
+      from: sys.from || "DNS-SUB <noreply@resend.dev>",
       to: [config.to],
       subject: msg.title,
       text: msg.content,

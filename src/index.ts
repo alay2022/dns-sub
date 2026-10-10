@@ -17,6 +17,8 @@ import { misubRoutes, misubPublicRoutes } from "./routes/misub";
 import { noticeRoutes } from "./routes/notices";
 import { profileRoutes } from "./routes/profile";
 import { backupRoutes } from "./routes/backup";
+import { mailSettingsRoutes } from "./routes/mail-settings";
+
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -50,6 +52,7 @@ app.route("/", misubPublicRoutes); // 公开订阅输出：GET /:idOrToken，不
 app.route("/api/notices", noticeRoutes);
 app.route("/api/profile", profileRoutes);
 app.route("/api/backup", backupRoutes);
+app.route("/api/mail-settings", mailSettingsRoutes);
 
 app.notFound((c) => c.json({ error: "Not Found" }, 404));
 app.onError((err, c) => {

@@ -80,7 +80,7 @@ notifyRoutes.post("/:id/test", async (c) => {
     await sendNotify(row.type, JSON.parse(row.config), {
       title: "DNS-SUB 测试通知",
       content: "这是一条测试消息，如果你收到了，说明该通知渠道配置成功。",
-    });
+    }, c.env);
     return c.json({ ok: true });
   } catch (e: any) {
     return c.json({ ok: false, error: e.message }, 200);
