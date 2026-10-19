@@ -22,3 +22,10 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: d64c5047d3766087d1b9b2bed2de17a9
         run: |
           npx wrangler d1 export dns-sub --remote -y --output=backup-$(date +%Y%m%d).sql
+
+      - name: Upload backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dns-sub-backup-${{ github.run_id }}
+          path: backup-*.sql
+          retention-days: 90
