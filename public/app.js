@@ -1,4 +1,6 @@
 const API = window.API_BASE || "";
+// CloudSSH 服务器管理（跨域读取，需在 CloudSSH fork 部署 CORS 补丁并配置 CORS_ALLOWED_ORIGINS）
+const CLOUDSSH = window.CLOUDSSH_BASE || "https://ssh.ztvps.com";
 
 /** 格式化域名到期时间，20天内标记为快到期(红色) */
 function formatDomainExpiry(whoisExpiresAt) {
@@ -155,7 +157,13 @@ const NAV = [
       { key: "providers", label: "域名平台账户" },
     ],
   },
-  { key: "ssl", label: "SSL 证书" },
+  {
+    label: "SSL 证书",
+    children: [
+      { key: "ssl", label: "SSL 证书" },
+      { key: "cloudssh", label: "CloudSSH 管理" },
+    ],
+  },
   { key: "misub", label: "MiSub订阅" },
   {
     label: "用户设置",
@@ -456,6 +464,7 @@ function renderPage() {
     favorites: renderFavorites,
     providers: renderProviders,
     ssl: renderSsl,
+    cloudssh: renderCloudSSH,
     users: renderUsers,
     notify: renderNotify,
     applink: renderApplink,
@@ -2352,6 +2361,114 @@ function enableDragReorder(container, itemSelector, onReorder) {
       container.insertBefore(dragEl, after ? el.nextSibling : el);
     });
   });
+}
+
+// ---------------- CloudSSH 服务器管理 ----------------
+function cssMaskHost(h) {
+  const m = (h || "").match(/^(\d+)\.(\d+)\.\d+\.\d+$/);
+  return m ? `${m[1]}.${m[2]}.*.*` : h || "";
+}
+function cssRelTime(ts) {
+  if (!ts) return "从未连接";
+  const s = ts < 1e12 ? ts : Math.floor(ts / 1000);
+  const d = Math.floor(Date.now() / 1000 - s);
+  if (d < 60) return "刚刚";
+  if (d < 3600) return `${Math.floor(d / 60)} 分钟前`;
+  if (d < 86400) return `${Math.floor(d / 3600)} 小时前`;
+  return `${Math.floor(d / 86400)} 天前`;
+}
+function cssEsc(s) {
+  return (s == null ? "" : String(s)).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+function cssHost() {
+  try { return new URL(CLOUDSSH).host; } catch { return CLOUDSSH; }
+}
+
+async function renderCloudSSH(main) {
+  main.innerHTML = `<div class="card"><h3>CloudSSH 服务器</h3>
+    <p style="color:var(--muted);font-size:14px;margin-bottom:12px">服务器数据来自 CloudSSH（${cssEsc(cssHost())}）。点击「连接」会在新标签页打开全屏终端。</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+      <input id="cssSearch" placeholder="按名称、主机或用户名搜索" style="flex:1;min-width:200px" />
+      <button class="secondary" id="cssRefresh">刷新</button>
+      <button class="secondary" id="cssOpenConsole">打开 CloudSSH 控制台</button>
+    </div>
+    <div id="cssList">加载中...</div></div>`;
+
+  document.getElementById("cssOpenConsole").onclick = () => window.open(CLOUDSSH, "_blank");
+  document.getElementById("cssRefresh").onclick = loadCssServers;
+  document.getElementById("cssSearch").oninput = () => {
+    const kw = document.getElementById("cssSearch").value.trim().toLowerCase();
+    document.querySelectorAll("#cssList .css-card").forEach((card) => {
+      card.style.display = !kw || (card.dataset.haystack || "").includes(kw) ? "" : "none";
+    });
+  };
+  await loadCssServers();
+}
+
+async function loadCssServers() {
+  const el = document.getElementById("cssList");
+  if (!el) return;
+  el.innerHTML = "加载中...";
+  try {
+    const r = await fetch(`${CLOUDSSH}/api/servers`, { credentials: "include" });
+    if (r.status === 401) {
+      el.innerHTML = `<div style="padding:16px;border:1px dashed var(--border);border-radius:8px;text-align:center">
+        <p>尚未登录 CloudSSH，请先在新标签页登录（GitHub 账号），登录后回到本页点「刷新」。</p>
+        <button class="css-login">去登录 CloudSSH</button></div>`;
+      el.querySelector(".css-login").onclick = () => window.open(CLOUDSSH, "_blank");
+      return;
+    }
+    if (!r.ok) throw new Error(`CloudSSH 返回 ${r.status}`);
+    const servers = await r.json();
+    if (!servers.length) {
+      el.innerHTML = `<p style="color:var(--muted)">CloudSSH 里还没有保存服务器，去控制台「添加服务器」后回来刷新。</p>`;
+      return;
+    }
+    el.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px">${
+      servers.map((s) => {
+        const hay = cssEsc(`${s.name} ${s.host} ${s.username}`.toLowerCase());
+        const tags = [s.os, s.region].filter(Boolean)
+          .map((t) => `<span class="tag issued" style="font-size:12px">${cssEsc(t)}</span>`).join(" ");
+        return `<div class="card css-card" style="margin-bottom:0" data-haystack="${hay}">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+            <b style="font-size:15px">${cssEsc(s.name)}</b>
+            <button class="css-connect secondary" data-id="${Number(s.id)}" data-name="${cssEsc(s.name)}">连接</button>
+          </div>
+          <div style="color:var(--muted);font-size:13px;margin-top:6px">${cssEsc(cssMaskHost(s.host))}:${cssEsc(s.port || 22)} · ${cssEsc(s.username || "")}</div>
+          <div style="margin-top:8px">${tags}<span style="color:var(--muted);font-size:12px;margin-left:6px">最近连接 ${cssRelTime(s.last_connected_at)}</span></div>
+        </div>`;
+      }).join("")
+    }</div>`;
+
+    el.querySelectorAll(".css-connect").forEach((btn) => (btn.onclick = () => cssConnect(btn.dataset.id, btn.dataset.name)));
+  } catch (e) {
+    el.innerHTML = `<p style="color:red">加载失败：${cssEsc(e.message)}。<br/>
+      <span style="color:var(--muted);font-size:13px">若提示 Failed to fetch：请确认 CloudSSH 的 CORS 补丁已部署、CORS_ALLOWED_ORIGINS 已配置、且你已在浏览器登录过 CloudSSH。</span></p>`;
+  }
+}
+
+async function cssConnect(id, name) {
+  // 先同步开窗，避免 await 之后 window.open 被浏览器弹窗拦截
+  const win = window.open("", "_blank");
+  try {
+    const r = await fetch(`${CLOUDSSH}/api/servers/${id}/connect`, {
+      method: "POST", credentials: "include",
+      headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    if (r.status === 401) {
+      win && win.close();
+      toast("请先登录 CloudSSH", "error");
+      window.open(CLOUDSSH, "_blank");
+      return;
+    }
+    if (!r.ok) throw new Error(`连接请求失败（${r.status}）`);
+    const { wsUrl } = await r.json();
+    const url = `${CLOUDSSH}/?wsUrl=${encodeURIComponent(wsUrl)}&name=${encodeURIComponent(name || "Server")}`;
+    if (win) win.location.href = url; else window.open(url, "_blank");
+  } catch (e) {
+    win && win.close();
+    toast(e.message, "error");
+  }
 }
 
 // ---------------- 渲染入口 ----------------
